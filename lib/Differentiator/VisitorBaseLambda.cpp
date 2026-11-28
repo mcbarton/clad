@@ -494,9 +494,7 @@ Expr* VisitorBase::buildClonedLambda(const LambdaExpr* LE) {
     Stmt* clonedS = CloneNode(S);
     // Register before remapping, so references in this statement update too.
     registerClonedDecls(S, clonedS, m_DeclReplacements);
-    utils::ReferencesUpdater up(m_Sema, getCurrentScope(), CallOp,
-                                m_DeclReplacements);
-    up.TraverseStmt(clonedS);
+    updateLambdaReferencesOf(clonedS, CallOp);
     addToCurrentBlock(clonedS);
   }
   return LBuilder.finish(endBlock());

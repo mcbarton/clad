@@ -212,6 +212,37 @@ double viaCustomCtor(double x) {
 
 // CHECK: constructor_reverse_forw(clad::Tag<geo::Wrap>(), x, 0.)
 
+// A callee's default argument names a type as its namespace sees it; the
+// derivative's call qualifies it.
+namespace lib {
+struct Opts {
+  double k = 2;
+};
+inline double scaled(double x, Opts o = Opts()) { return o.k * x * x; }
+} // namespace lib
+double viaDefault(double x) { return lib::scaled(x); }
+
+// CHECK: lib::scaled_pullback(x, lib::Opts(), 1, &_r0, &_r1);
+
+// A member function names static members without a qualifier; its free
+// derivative qualifies them.
+namespace geo {
+struct Gain {
+  static constexpr double base = 2;
+  static int order() { return 2; }
+  double k;
+  double apply(double x) const { return base * k * x / order(); }
+};
+} // namespace geo
+double viaStatic(double x) {
+  geo::Gain g{3};
+  return g.apply(x);
+}
+
+// CHECK: void apply_pullback(const geo::Gain *self, double x, double _d_y, geo::Gain *_d_this, double *_d_x)
+// CHECK: double _t0 = geo::Gain::order();
+// CHECK: _d_this->k += geo::Gain::base * _d_y / _t0 * x;
+
 // A type of an unnamed namespace is named through the namespace around it.
 namespace geo {
 namespace {
@@ -279,6 +310,8 @@ auto g_viaScale = clad::gradient(viaScale);
 auto g_viaMember = clad::gradient(viaMember);
 auto g_viaCtor = clad::gradient(viaCtor);
 auto g_viaCustomCtor = clad::gradient(viaCustomCtor);
+auto g_viaDefault = clad::gradient(viaDefault);
+auto g_viaStatic = clad::gradient(viaStatic);
 auto g_viaUnnamed = clad::gradient(viaUnnamed);
 auto g_viaSubstituted = clad::gradient(viaSubstituted);
 auto g_viaDeduced = clad::gradient(viaDeduced);

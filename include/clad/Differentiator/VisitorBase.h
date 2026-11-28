@@ -830,8 +830,15 @@ namespace clad {
     clang::IdentifierInfo* CreateUniqueIdentifier(llvm::StringRef nameBase);
     std::unordered_map<std::string, std::size_t> m_idCtr;
 
-    /// Updates references in newly cloned statements.
-    void updateReferencesOf(clang::Stmt* InSubtree);
+    /// Makes a statement clad copied into the derivative refer to what it
+    /// should there; see ReferencesUpdater.
+    /// \returns the copy; its root may have been replaced.
+    clang::Stmt* updateReferencesOf(clang::Stmt* InSubtree);
+    /// Points the references in \p S, copied from the body of the lambda whose
+    /// call operator is \p CallOp, to the declarations that replace them.
+    void updateLambdaReferencesOf(clang::Stmt* S,
+                                  const clang::FunctionDecl* CallOp);
+    class ReferencesUpdater;
 
     /// Get an expression used to zero-initialize given type.
     /// Returns 0 for scalar types, otherwise {}.

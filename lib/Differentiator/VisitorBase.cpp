@@ -31,6 +31,7 @@
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/ExceptionSpecificationType.h"
+#include "clang/Basic/LLVM.h"
 #include "clang/Basic/Lambda.h"
 #include "clang/Basic/OperatorKinds.h"
 #include "clang/Basic/SourceManager.h"
@@ -259,10 +260,179 @@ namespace clad {
     return Stmts;
   }
 
-  void VisitorBase::updateReferencesOf(Stmt* InSubtree) {
-    utils::ReferencesUpdater up(m_Sema, getCurrentScope(), m_DiffReq.Function,
-                                m_DeclReplacements, getSelf());
-    up.TraverseStmt(InSubtree);
+  /// Makes code clad copied refer to what it should where it is copied to:
+  /// the declarations clad replaced, and what the current scope finds by the
+  /// same name. In the derivative it also adds the qualifiers names need
+  /// there, writes types as that scope can read them, and uses `self` for
+  /// `this` in a free derivative of a member.
+  class VisitorBase::ReferencesUpdater
+      : public RecursiveASTVisitor<ReferencesUpdater> {
+    VisitorBase& m_V;
+    /// The function whose declarations the copy refers to.
+    const FunctionDecl* m_Function;
+    /// Whether the copy goes into the derivative, rather than being only
+    /// re-pointed to replaced declarations.
+    bool m_IntoDerivative;
+
+  public:
+    ReferencesUpdater(VisitorBase& V, const FunctionDecl* Function,
+                      bool IntoDerivative)
+        : m_V(V), m_Function(Function), m_IntoDerivative(IntoDerivative) {}
+
+    // A replacement is built from the node's children, so update them first.
+    [[nodiscard]] bool shouldTraversePostOrder() const {
+      return m_IntoDerivative;
+    }
+
+    bool VisitDeclRefExpr(DeclRefExpr* DRE) {
+      // Only declarations of the function being differentiated are updated.
+      DeclContext* Ctx = DRE->getDecl()->getDeclContext();
+      // Skip the synthetic capture scope (e.g. OpenMP).
+      while (isa<CapturedDecl>(Ctx))
+        Ctx = Ctx->getParent();
+      // A declaration of a lambda in the function, such as one of its
+      // parameters, is only updated when it was replaced, as when its body
+      // is differentiated in place.
+      bool InLambda = !Ctx->Encloses(m_Function) && m_Function->Encloses(Ctx);
+      if (!Ctx->Encloses(m_Function) && !InLambda)
+        return true;
+
+      // Replace the declaration if it is present in `m_DeclReplacements`.
+      if (auto* VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        auto it = m_V.m_DeclReplacements.find(VD);
+        if (it != m_V.m_DeclReplacements.end()) {
+          DRE->setDecl(it->second);
+          DRE->getDecl()->setReferenced();
+          DRE->getDecl()->setIsUsed();
+          QualType NonRefQT = it->second->getType().getNonReferenceType();
+          if (NonRefQT != DRE->getType())
+            DRE->setType(NonRefQT);
+        }
+      }
+      if (InLambda)
+        return true;
+
+      DeclarationNameInfo DNI = DRE->getNameInfo();
+      LookupResult R(m_V.m_Sema, DNI, Sema::LookupOrdinaryName);
+      m_V.m_Sema.LookupName(R, m_V.getCurrentScope(),
+                            /*allowBuiltinCreation=*/false);
+      if (R.empty())
+        return true; // Nothing to update.
+
+      // FIXME: Handle the case when there are overloads found. Update
+      // it with the best match.
+      //
+      // FIXME: This is the right way to go in principle, however there is no
+      // properly built decl context.
+      // m_Sema.MarkDeclRefReferenced(clonedDRE);
+      if (!R.isSingleResult())
+        return true;
+
+      if (auto* VD = dyn_cast<ValueDecl>(R.getFoundDecl())) {
+        DRE->setDecl(VD);
+        VD->setReferenced();
+        VD->setIsUsed();
+        m_V.m_Sema.MarkDeclarationsReferencedInExpr(DRE);
+      }
+      updateType(DRE->getType());
+      return true;
+    }
+
+    bool VisitStmt(Stmt* S) {
+      if (auto* E = dyn_cast<Expr>(S))
+        updateType(E->getType());
+      if (m_IntoDerivative)
+        for (Stmt*& Child : S->children())
+          if (auto* E = dyn_cast_or_null<Expr>(Child))
+            if (Expr* New = rebuild(E))
+              Child = New;
+      return true;
+    }
+
+    /// Updates the size expression of a variable-length array type and the
+    /// expression of a decltype.
+    void updateType(QualType QT) {
+      if (const auto* VAT = dyn_cast<VariableArrayType>(QT))
+        TraverseStmt(VAT->getSizeExpr());
+      else if (const auto* DT = dyn_cast<DecltypeType>(QT))
+        TraverseStmt(DT->getUnderlyingExpr());
+    }
+
+    /// What \p E becomes in the derivative, or null to keep it.
+    Expr* rebuild(Expr* E) {
+      ASTContext& C = m_V.m_Context;
+      Sema& S = m_V.m_Sema;
+      // In a free derivative of a member, `self` replaces `this`, including
+      // implicit uses. A `this` of another class stays, such as one in code
+      // copied from a base class.
+      if (const auto* This = dyn_cast<CXXThisExpr>(E)) {
+        const ParmVarDecl* Self = m_V.getSelf();
+        if (Self && C.hasSameUnqualifiedType(This->getType()->getPointeeType(),
+                                             Self->getType()->getPointeeType()))
+          return m_V.BuildSelfRef();
+        return nullptr;
+      }
+      // Code copied from elsewhere, such as a callee's default argument, may
+      // name a variable, function or type the way its own namespace sees it,
+      // without a qualifier. The derivative can live in another scope, so add
+      // the qualifiers it needs.
+      if (auto* DRE = dyn_cast<DeclRefExpr>(E)) {
+        auto* D = dyn_cast<DeclaratorDecl>(DRE->getDecl());
+        // Namespace-scope variables and functions, and static members, need
+        // a qualifier when the derivative is outside their scope.
+        bool Qualifiable = false;
+        if (const auto* MD = dyn_cast_or_null<CXXMethodDecl>(D))
+          Qualifiable = MD->isStatic();
+        else if (isa_and_nonnull<FunctionDecl>(D))
+          Qualifiable = true;
+        else if (const auto* VD = dyn_cast_or_null<VarDecl>(D))
+          Qualifiable = VD->isFileVarDecl() || VD->isStaticDataMember();
+        const DeclContext* Here = m_V.m_Derivative->getDeclContext();
+        if (Qualifiable && !DRE->hasQualifier() &&
+            !DRE->hasExplicitTemplateArgs() &&
+            !D->getDeclContext()->getRedeclContext()->Encloses(Here))
+          return m_V.BuildDeclRef(D, clad_compat::nullNNS(),
+                                  DRE->getValueKind());
+        return nullptr;
+      }
+      auto Readable = [&](TypeSourceInfo* TSI) {
+        QualType T = utils::makeTypeReadable(S, TSI->getType());
+        return C.getTrivialTypeSourceInfo(T, TSI->getTypeLoc().getBeginLoc());
+      };
+      if (auto* CE = dyn_cast<ExplicitCastExpr>(E)) {
+        CE->setTypeInfoAsWritten(Readable(CE->getTypeInfoAsWritten()));
+      } else if (auto* UE = dyn_cast<UnaryExprOrTypeTraitExpr>(E)) {
+        if (UE->isArgumentType())
+          UE->setArgument(Readable(UE->getArgumentTypeInfo()));
+      } else if (auto* SV = dyn_cast<CXXScalarValueInitExpr>(E)) {
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        return new (C) CXXScalarValueInitExpr(SV->getType(),
+                                              Readable(SV->getTypeSourceInfo()),
+                                              SV->getRParenLoc());
+      } else if (auto* TO = dyn_cast<CXXTemporaryObjectExpr>(E)) {
+        llvm::SmallVector<Expr*, 4> Args(TO->arg_begin(), TO->arg_end());
+        SourceLocation L = TO->getParenOrBraceRange().getBegin();
+        SourceLocation R = TO->getParenOrBraceRange().getEnd();
+        return S
+            .BuildCXXTypeConstructExpr(Readable(TO->getTypeSourceInfo()), L,
+                                       Args, R, TO->isListInitialization())
+            .get();
+      }
+      return nullptr;
+    }
+  };
+
+  Stmt* VisitorBase::updateReferencesOf(Stmt* InSubtree) {
+    ReferencesUpdater Up(*this, m_DiffReq.Function, /*IntoDerivative=*/true);
+    Up.TraverseStmt(InSubtree);
+    auto* E = dyn_cast_or_null<Expr>(InSubtree);
+    Expr* New = E ? Up.rebuild(E) : nullptr;
+    return New ? New : InSubtree;
+  }
+
+  void VisitorBase::updateLambdaReferencesOf(Stmt* S,
+                                             const FunctionDecl* CallOp) {
+    ReferencesUpdater(*this, CallOp, /*IntoDerivative=*/false).TraverseStmt(S);
   }
 
   VarDecl* VisitorBase::BuildVarDecl(clang::QualType Type,
@@ -576,8 +746,7 @@ namespace clad {
 
   Stmt* VisitorBase::Clone(const clang::Stmt* S) {
     Stmt* clonedStmt = m_Builder.m_NodeCloner->Clone(S);
-    updateReferencesOf(clonedStmt);
-    return clonedStmt;
+    return clonedStmt ? updateReferencesOf(clonedStmt) : nullptr;
   }
   Expr* VisitorBase::Clone(const clang::Expr* E) {
     const Stmt* S = E;
@@ -603,9 +772,8 @@ namespace clad {
 
   QualType VisitorBase::CloneType(const QualType QT) {
     auto clonedType = m_Builder.m_NodeCloner->CloneType(QT);
-    utils::ReferencesUpdater up(m_Sema, getCurrentScope(), m_DiffReq.Function,
-                                m_DeclReplacements);
-    up.updateType(clonedType);
+    ReferencesUpdater(*this, m_DiffReq.Function, /*IntoDerivative=*/false)
+        .updateType(clonedType);
     return clonedType;
   }
   Expr* VisitorBase::BuildOp(clang::UnaryOperatorKind OpCode, clang::Expr* E,
