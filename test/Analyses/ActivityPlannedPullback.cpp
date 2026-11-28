@@ -42,10 +42,10 @@ double f(double x) {
 
 #ifdef REPORT_ONCE
 // The planner walks report() for each of its two pullbacks, and reports what
-// is wrong in it once.
+// is wrong in it once: here a pullback that takes a parameter too many.
 double sq(double x) { return x * x; }
 namespace clad::custom_derivatives {
-void sq_pullback(double x, double d, double* dx) { // expected-note {{candidate 'sq_pullback' has different number of parameters}}
+void sq_pullback(double x, double d, double* dx, double* extra) { // expected-note {{candidate 'sq_pullback' has different number of parameters}}
   *dx += 2 * x * d;
 }
 } // namespace clad::custom_derivatives

@@ -2802,7 +2802,28 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
         DiffRequest R = request;
         R.BaseFunctionName = utils::ComputeEffectiveFnName(R.Function);
         R.Mode = DiffMode::pullback;
-        if (LookupCustomDerivativeDecl(R)) {
+        // The request was planned as a pushforward and names no parameters,
+        // which asks for a pullback without the adjoint of the argument. Look
+        // first for the one a user writes, which takes it: otherwise a pullback
+        // that is merely unused is reported as one with the wrong signature,
+        // an error. Then for one without the adjoint, which is as unused, and
+        // report what matches neither against the pullback a user has to write.
+        DiffRequest Full = R;
+        Full.DVI.clear();
+        for (const ParmVarDecl* PVD : Full.Function->parameters())
+          if (!utils::hasNonDifferentiableAttribute(PVD))
+            Full.DVI.push_back(PVD);
+        bool declared = false;
+        bool found = false;
+        if (LookupCustomDerivativeDecl(Full, &declared)) {
+          R = Full;
+          found = true;
+        } else if (declared) {
+          found = LookupCustomDerivativeDecl(R, &declared);
+          if (!found)
+            LookupCustomDerivativeDecl(Full);
+        }
+        if (found) {
           utils::diag(
               m_Sema, DiagnosticsEngine::Warning, R.CallContext->getBeginLoc(),
               "unused function '%0_pullback'; '%0' is a real-domain, "
